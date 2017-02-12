@@ -5,3 +5,8 @@ authors = ["Brian Anderson <banderson@mozilla.com>"]
 
 [dependencies]
 error-chain = "0.8.0"
+memmap = "0.5.0"
+fs2 = "0.4.1"
+scopeguard = "0.3.2"
+nom = "2.1.0"
+byteorder = "1.0.0"

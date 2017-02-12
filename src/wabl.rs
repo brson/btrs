@@ -4,20 +4,20 @@ use wal::*;
 use std::path::Path;
 use std::convert::AsRef;
 
-pub struct BlockStore;
+pub struct PageStore;
 
 pub struct Wabl {
-    bs: BlockStore,
+    bs: PageStore,
     wal: Wal,
 }
 
 pub struct ReadWabl<'a> {
-    bs: &'a mut BlockStore,
+    bs: &'a mut PageStore,
     wal: ReadWal<'a>
 }
 
 pub struct WriteWabl<'a> {
-    bs: &'a mut BlockStore,
+    bs: &'a mut PageStore,
     wal: WriteWal<'a>,
 }
 
@@ -35,9 +35,9 @@ impl Wabl {
 }
 
 impl<'a> ReadWabl<'a> {
-    fn read_block(&mut self, i: BlockNum) -> Result<Block> { panic!() }
+    fn read_page(&mut self, i: PageNum) -> Result<Page> { panic!() }
 
-    fn begin_write(&mut self) -> Result<WriteWabl> {
+    fn begin_write(self) -> Result<WriteWabl<'a>> {
         Ok(WriteWabl {
             bs: self.bs,
             wal: self.wal.begin_write()?,
@@ -46,11 +46,11 @@ impl<'a> ReadWabl<'a> {
 }
 
 impl<'a> WriteWabl<'a> {
-    fn read_block(&mut self, i: BlockNum) -> Result<Block> { panic!() }
+    fn read_page(&mut self, i: PageNum) -> Result<Page> { panic!() }
 
-    fn write_block(&mut self, i: BlockNum, b: Block) -> Result<()> { panic!() }
+    fn write_page(&mut self, i: PageNum, b: Page) -> Result<()> { panic!() }
 
-    fn push_block(&mut self, b: Block) -> Result<BlockNum> { panic!() }
+    fn push_page(&mut self, b: Page) -> Result<PageNum> { panic!() }
 
     fn commit(self) -> Result<()> { panic!() }
 
