@@ -10,7 +10,7 @@ use std::iter;
 use fs2::FileExt;
 use units::PageSize;
 use byteorder::*;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::cell::RefCell;
 use lock::*;
@@ -45,12 +45,13 @@ pub struct Wal {
     file: Rc<RefCell<File>>,
     index: WalIndex,
     page_size: PageSize,
+    epoch: u64,
     frame_map: FrameMap,
 }
 
 struct FrameMap {
     num_frames: u32,
-    pages: HashMap<PageNum, FrameNum>,
+    pages: BTreeMap<PageNum, FrameNum>,
 }
 
 pub struct ReadWal<'a> {
@@ -63,10 +64,14 @@ pub struct WriteWal<'a> {
     lock: WriteLock,
 }
 
-pub struct CheckpointIter;
+pub struct Checkpoint<'a> {
+    wal: &'a mut Wal,
+    clock: CheckpointLock,
+    wlock: WriteLock,
+}
 
 const HEADER_SIZE: u32 = 512;
-const FRAME_HEADER_SIZE: u32 = 8;
+const FRAME_HEADER_SIZE: u32 = 16;
 
 #[derive(Debug, Eq, PartialEq)]
 struct Header {
@@ -96,9 +101,10 @@ impl Wal {
             file: Rc::new(RefCell::new(file)),
             index: index,
             page_size: page_size,
+            epoch: 0,
             frame_map: FrameMap {
                 num_frames: 0,
-                pages: HashMap::new(),
+                pages: BTreeMap::new(),
             },
         };
 
@@ -108,21 +114,34 @@ impl Wal {
     }
 
     fn init(&mut self, page_size: PageSize) -> Result<()> {
-        let lock = self.checkpoint_lock()?;
-        let reinit;
-        if let Some(header) = self.read_header(&lock)? {
-            reinit = header.magic != MAGIC || header.page_size != page_size;
+        let wlock = self.write_lock()?;
+        let clock = self.checkpoint_lock()?;
+        let header = self.read_header(&wlock)?;
+        let mut write = true;
+        let header = if let Some(mut h) = header {
+            let header_ok = h.magic == MAGIC || h.page_size == page_size;
+            if !header_ok {
+                Header {
+                    magic: MAGIC,
+                    page_size: page_size,
+                    epoch: 0,
+                }
+            } else {
+                write = false;
+                h
+            }
         } else {
-            reinit = true;
-        }
-
-        if reinit {
-            let header = Header {
+            Header {
                 magic: MAGIC,
                 page_size: page_size,
                 epoch: 0,
-            };
-            self.write_header(header, &lock)?;
+            }
+        };
+
+        self.epoch = header.epoch;
+
+        if write {
+            self.write_header(header, &clock)?;
         }
 
         Ok(())
@@ -136,7 +155,11 @@ impl Wal {
         Ok(WriteWal::new(self)?)
     }
 
-    fn read_header(&mut self, lock: &CheckpointLock) -> Result<Option<Header>> {
+    pub fn begin_checkpoint(&mut self) -> Result<Checkpoint> {
+        Ok(Checkpoint::new(self)?)
+    }
+
+    fn read_header(&mut self, lock: &ReadOrWriteLock) -> Result<Option<Header>> {
         let mut file = self.file.borrow_mut();
 
         if file.metadata()?.len() == 0 {
@@ -179,7 +202,7 @@ impl Wal {
         HEADER_SIZE as u64 + fr as u64 * self.frame_size() as u64
     }
 
-    fn seek_frame(&mut self, fr: FrameNum) -> Result<()> {
+    fn seek_frame(&self, fr: FrameNum) -> Result<()> {
         self.file.borrow_mut().seek(SeekFrom::Start(self.frame_offset(fr)))?;
 
         Ok(())
@@ -197,7 +220,7 @@ impl Wal {
         Ok(CheckpointLock(ExLock::new(self.file.clone())?))
     }
 
-    fn read_page(&mut self, bn: PageNum, lock: &ReadOrWriteLock) -> Result<Option<Page>>
+    fn read_page(&self, bn: PageNum, lock: &ReadOrWriteLock) -> Result<Option<Page>>
     {
         if let Some(frame_num) = self.frame_map.pages.get(&bn).cloned() {
             let mut page = Page::new(self.page_size);
@@ -205,7 +228,10 @@ impl Wal {
             // FIXME: Double seek
             self.seek_frame(frame_num)?;
             let mut file = self.file.borrow_mut();
-            file.seek(SeekFrom::Current(mem::size_of::<u32>() as i64 * 2))?;
+            let u8_sz = mem::size_of::<u32>() as i64;
+            let u64_sz = mem::size_of::<u64>() as i64;
+            let header_sz = u8_sz * 2 + u64_sz;
+            file.seek(SeekFrom::Current(header_sz))?;
             file.read_exact(page.buf_mut())?;
 
             Ok(Some(page))
@@ -217,21 +243,35 @@ impl Wal {
     fn update_frame_map(&mut self, lock: &ReadOrWriteLock) -> Result<()> {
         let file_len = self.file.borrow().metadata()?.len();
 
-        let mut uncommitted = HashMap::new();
+        let header = self.read_header(lock)?.expect("bad header");
+        if header.epoch != self.epoch {
+            println!("new epoch: {}", header.epoch);
+            self.frame_map.pages.clear();
+            self.frame_map.num_frames = 0;
+            self.epoch = header.epoch;
+        }
+
+        let mut uncommitted = BTreeMap::new();
         
         for frame in self.frame_map.num_frames.. {
             self.seek_frame(frame)?;
 
             let r = || -> Result<(PageNum, u32)> {
+                let err = || Err(IoError::from(IoErrorKind::UnexpectedEof).into());
                 let mut file = self.file.borrow_mut();
                 let mut rdr = BufReader::new(&mut *file);
                 let page_num = rdr.read_u32::<LittleEndian>()?;
                 let commit_flag = rdr.read_u32::<LittleEndian>()?;
+                let epoch = rdr.read_u64::<LittleEndian>()?;
+
+                if epoch != self.epoch {
+                    return err();
+                }
 
                 // Is there actually space allocated for this frame?
                 let next_frame_offset = self.frame_offset(frame + 1);
                 if next_frame_offset > file_len {
-                    return Err(IoError::from(IoErrorKind::UnexpectedEof).into());
+                    return err();
                 }
                 Ok((page_num, commit_flag))
             }();
@@ -249,7 +289,8 @@ impl Wal {
                     // If this is a commit frame then update the frame
                     // map.
                     if commit_flag != 0 {
-                        self.frame_map.pages.extend(uncommitted.drain());
+                        let new_pages = mem::replace(&mut uncommitted, BTreeMap::new());
+                        self.frame_map.pages.extend(new_pages.into_iter());
                         self.frame_map.num_frames = frame + 1;
                     }
                 }
@@ -259,7 +300,14 @@ impl Wal {
         Ok(())
     }
 
-
+    pub fn dump(&self) {
+        println!("----");
+        println!("epoch: {}", self.epoch);
+        println!("frames: {}", self.frame_map.num_frames);
+        for (page, frame)  in &self.frame_map.pages {
+            println!("page {}: frame {}", page, frame);
+        }
+    }
 }
 
 impl<'a> ReadWal<'a> {
@@ -272,12 +320,17 @@ impl<'a> ReadWal<'a> {
         })
     }
 
-    pub fn read_page(&mut self, i: PageNum) -> Result<Option<Page>> {
+    pub fn read_page(&self, i: PageNum) -> Result<Option<Page>> {
         self.wal.read_page(i, &self.lock)
     }
 
     pub fn begin_write(self) -> Result<WriteWal<'a>> {
-        Ok(WriteWal::new(self.wal)?)
+        // Drop the read lock before taking the write lock.
+        // update_frame_map will deal with any log changes between the
+        // two. FIXME: this is too tricky!
+        let wal = self.wal;
+        { let _ = self.lock; }
+        Ok(WriteWal::new(wal)?)
     }
 }
 
@@ -291,7 +344,7 @@ impl<'a> WriteWal<'a> {
         })
     }
 
-    pub fn read_page(&mut self, i: PageNum) -> Result<Option<Page>> {
+    pub fn read_page(&self, i: PageNum) -> Result<Option<Page>> {
         self.wal.read_page(i, &self.lock)
     }
 
@@ -304,7 +357,7 @@ impl<'a> WriteWal<'a> {
         let frame_num = self.wal.frame_map.num_frames;
         self.write_frame(frame_num, i, b)?;
         self.wal.frame_map.num_frames += 1;
-        self.wal.frame_map.pages.insert(frame_num, i);
+        self.wal.frame_map.pages.insert(i, frame_num);
 
         Ok(())
     }
@@ -318,6 +371,7 @@ impl<'a> WriteWal<'a> {
         let mut wtr = BufWriter::new(&mut *file);
         wtr.write_u32::<LittleEndian>(page_num)?;
         wtr.write_u32::<LittleEndian>(0)?;
+        wtr.write_u64::<LittleEndian>(self.wal.epoch)?;
         wtr.write_all(&b.0)?;
         wtr.flush()?; // FIXME don't flush. Need a better BufWriter?
 
@@ -341,3 +395,42 @@ impl<'a> WriteWal<'a> {
     }
 }
 
+use std::collections::btree_map;
+type Pages<'a> = btree_map::Keys<'a, PageNum, FrameNum>;
+
+impl<'a> Checkpoint<'a> {
+    fn new(wal: &'a mut Wal) -> Result<Checkpoint<'a>> {
+        // NB field order / unlocking order
+        let wlock = wal.write_lock()?;
+        let clock = wal.checkpoint_lock()?;
+        wal.update_frame_map(&wlock)?;
+        wal.file.borrow().sync_data()?;
+        Ok(Checkpoint {
+            wal: wal,
+            clock: clock,
+            wlock: wlock,
+        })
+    }
+
+    pub fn pages(&self) -> Pages {
+        self.wal.frame_map.pages.keys()
+    }
+
+    pub fn read_page(&self, i: PageNum) -> Result<Option<Page>> {
+        self.wal.read_page(i, &self.wlock)
+    }
+
+    pub fn next_epoch(self) -> Result<()> {
+        // Update the epoch in the header. Don't update our own
+        // header state. That will happen like any other reader next
+        // time we do a read.
+        let header = Header {
+            magic: MAGIC,
+            page_size: self.wal.page_size,
+            epoch: self.wal.epoch + 1,
+        };
+        self.wal.write_header(header, &self.clock)?;
+        
+        Ok(())
+    }
+}
