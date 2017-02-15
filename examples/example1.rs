@@ -4,6 +4,7 @@ use std::fs;
 use btrs::errors::*;
 use btrs::units::*;
 use btrs::wal::*;
+use btrs::page::*;
 
 fn main() {
     run().unwrap();
@@ -65,12 +66,13 @@ fn run() -> Result<()> {
         let wal = wal.begin_checkpoint()?;
         for page in wal.pages() {
             println!("replaying page {}", page);
+            let _page = wal.read_page(*page)?;
         }
         wal.next_epoch()?;
     }
     wal.dump();
     {
-        wal.begin_read();
+        wal.begin_read()?;
     }
     wal.dump();
 

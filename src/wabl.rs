@@ -1,6 +1,6 @@
+use page::Page;
 use errors::*;
 use wal::*;
-
 use std::path::Path;
 use std::convert::AsRef;
 

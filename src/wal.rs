@@ -1,3 +1,6 @@
+//! A simple write ahead log
+
+use page::Page;
 use std::mem;
 use errors::*;
 use wal_index::*;
@@ -16,27 +19,6 @@ use std::cell::RefCell;
 use lock::*;
 use std::io::Error as IoError;
 use std::io::ErrorKind as IoErrorKind;
-
-const MAGIC: u64 = 0x11a8b23d4760cdb4;
-
-pub struct Page(Vec<u8>);
-
-impl Page {
-    pub fn new(size: PageSize) -> Page {
-        let size = size.to_u32() as usize;
-        let mut buf = Vec::with_capacity(size);
-        buf.extend(iter::repeat(0).take(size));
-        Page(buf)
-    }
-
-    pub fn buf(&self) -> &[u8] {
-        &self.0
-    }
-
-    pub fn buf_mut(&mut self) -> &mut [u8] {
-        &mut self.0
-    }
-}
 
 pub type PageNum = u32;
 pub type FrameNum = u32;
@@ -70,6 +52,7 @@ pub struct Checkpoint<'a> {
     wlock: WriteLock,
 }
 
+const MAGIC: u64 = 0x11a8b23d4760cdb4;
 const HEADER_SIZE: u32 = 512;
 const FRAME_HEADER_SIZE: u32 = 16;
 
@@ -203,7 +186,15 @@ impl Wal {
     }
 
     fn seek_frame(&self, fr: FrameNum) -> Result<()> {
-        self.file.borrow_mut().seek(SeekFrom::Start(self.frame_offset(fr)))?;
+        let offset = self.frame_offset(fr);
+        self.file.borrow_mut().seek(SeekFrom::Start(offset))?;
+
+        Ok(())
+    }
+
+    fn seek_frame_offset(&self, fr: FrameNum, bytes: u64) -> Result<()> {
+        let offset = self.frame_offset(fr) + bytes;
+        self.file.borrow_mut().seek(SeekFrom::Start(offset))?;
 
         Ok(())
     }
@@ -225,19 +216,42 @@ impl Wal {
         if let Some(frame_num) = self.frame_map.pages.get(&bn).cloned() {
             let mut page = Page::new(self.page_size);
 
-            // FIXME: Double seek
-            self.seek_frame(frame_num)?;
-            let mut file = self.file.borrow_mut();
-            let u8_sz = mem::size_of::<u32>() as i64;
-            let u64_sz = mem::size_of::<u64>() as i64;
+            let u8_sz = mem::size_of::<u32>() as u64;
+            let u64_sz = mem::size_of::<u64>() as u64;
             let header_sz = u8_sz * 2 + u64_sz;
-            file.seek(SeekFrom::Current(header_sz))?;
+            self.seek_frame_offset(frame_num, header_sz)?;
+            let mut file = self.file.borrow_mut();
             file.read_exact(page.buf_mut())?;
 
             Ok(Some(page))
         } else {
             Ok(None)
         }
+    }
+
+    fn write_page(&mut self, i: PageNum, p: Page, lock: &WriteLock) -> Result<()> {
+        let frame_num = self.frame_map.num_frames;
+        self.write_frame(frame_num, i, p, lock)?;
+        self.frame_map.num_frames += 1;
+        self.frame_map.pages.insert(i, frame_num);
+
+        Ok(())
+    }
+
+    fn write_frame(&mut self, frame_num: FrameNum,
+                   page_num: PageNum, b: Page, lock: &WriteLock) -> Result<()>
+    {
+        assert!(b.buf().len() as u32 == self.page_size.to_u32());
+        self.seek_frame(frame_num)?;
+        let mut file = self.file.borrow_mut();
+        let mut wtr = BufWriter::new(&mut *file);
+        wtr.write_u32::<LittleEndian>(page_num)?;
+        wtr.write_u32::<LittleEndian>(0)?;
+        wtr.write_u64::<LittleEndian>(self.epoch)?;
+        wtr.write_all(b.buf())?;
+        wtr.flush()?; // FIXME don't flush. Need a better BufWriter?
+
+        Ok(())
     }
 
     fn update_frame_map(&mut self, lock: &ReadOrWriteLock) -> Result<()> {
@@ -300,6 +314,21 @@ impl Wal {
         Ok(())
     }
 
+    fn commit(&mut self, lock: &WriteLock) -> Result<()> {
+        if self.frame_map.num_frames == 0 {
+            return Ok(());
+        }
+
+        // Set the commit flag on last written page
+        let frame = self.frame_map.num_frames - 1;
+        let commit_flag_offset = mem::size_of::<u32>() as u64;
+        self.seek_frame_offset(frame, commit_flag_offset)?;
+        let mut file = self.file.borrow_mut();
+        file.write_u32::<LittleEndian>(1)?;
+
+        Ok(())
+    }
+
     pub fn dump(&self) {
         println!("----");
         println!("epoch: {}", self.epoch);
@@ -353,45 +382,12 @@ impl<'a> WriteWal<'a> {
     /// This can be used to write page numbers beyond the end of the
     /// page store. Wabl will know to extend the page store during
     /// checkpointing.
-    pub fn write_page(&mut self, i: PageNum, b: Page) -> Result<()> {
-        let frame_num = self.wal.frame_map.num_frames;
-        self.write_frame(frame_num, i, b)?;
-        self.wal.frame_map.num_frames += 1;
-        self.wal.frame_map.pages.insert(i, frame_num);
-
-        Ok(())
+    pub fn write_page(&mut self, i: PageNum, p: Page) -> Result<()> {
+        self.wal.write_page(i, p, &self.lock)
     }
 
-    fn write_frame(&mut self, frame_num: FrameNum,
-                   page_num: PageNum, b: Page) -> Result<()>
-    {
-        assert!(b.0.len() as u32 == self.wal.page_size.to_u32());
-        self.wal.seek_frame(frame_num)?;
-        let mut file = self.wal.file.borrow_mut();
-        let mut wtr = BufWriter::new(&mut *file);
-        wtr.write_u32::<LittleEndian>(page_num)?;
-        wtr.write_u32::<LittleEndian>(0)?;
-        wtr.write_u64::<LittleEndian>(self.wal.epoch)?;
-        wtr.write_all(&b.0)?;
-        wtr.flush()?; // FIXME don't flush. Need a better BufWriter?
-
-        Ok(())
-    }
-
-    pub fn commit(&mut self) -> Result<()> {
-        if self.wal.frame_map.num_frames == 0 {
-            return Ok(());
-        }
-
-        // Set the commit flag on last written page
-        // FIXME: 2 seeks is 2 too many
-        let frame = self.wal.frame_map.num_frames - 1;
-        self.wal.seek_frame(frame)?;
-        let mut file = self.wal.file.borrow_mut();
-        file.seek(SeekFrom::Current(mem::size_of::<u32>() as i64))?;
-        file.write_u32::<LittleEndian>(1)?;
-
-        Ok(())
+    pub fn commit(self) -> Result<()> {
+        self.wal.commit(&self.lock)
     }
 }
 

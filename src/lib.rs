@@ -23,3 +23,4 @@ pub mod wal_index;
 pub mod wabl;
 pub mod units;
 pub mod lock;
+pub mod page;
