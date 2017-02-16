@@ -389,6 +389,16 @@ impl<'a> WriteWal<'a> {
     pub fn commit(self) -> Result<()> {
         self.wal.commit(&self.lock)
     }
+
+    pub fn rollback(self) -> Result<()> {
+        panic!()
+    }
+}
+
+impl<'a> Drop for WriteWal<'a> {
+    fn drop(&mut self) {
+        // FIXME drop bomb
+    }
 }
 
 use std::collections::btree_map;
