@@ -1,9 +1,12 @@
+use units::PageSize;
 use page::Page;
 use errors::*;
 use wal::*;
 use std::path::Path;
 use std::convert::AsRef;
 use page_store::PageStore;
+
+const DEFAULT_PAGE_SIZE: u32 = 4096;
 
 pub struct Wabl {
     ps: PageStore,
@@ -21,7 +24,13 @@ pub struct WriteWabl<'a> {
 }
 
 impl Wabl {
-    fn new<P: AsRef<Path>>(p: &P) -> Result<Wabl> { panic!() }
+    fn new<P: AsRef<Path>>(p: &P) -> Result<Wabl> {
+        let page_size = PageSize::new(DEFAULT_PAGE_SIZE);
+        Ok(Wabl {
+            ps: PageStore::new(p, page_size)?,
+            wal: Wal::new(p, page_size)?,
+        })
+    }
 
     fn begin_read(&mut self) -> Result<ReadWabl> {
         Ok(ReadWabl {

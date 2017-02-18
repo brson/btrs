@@ -44,6 +44,8 @@ pub struct ReadWal<'a> {
 pub struct WriteWal<'a> {
     wal: &'a mut Wal,
     lock: WriteLock,
+    uncommitted_frame_map: FrameMap,
+    disarm: bool,
 }
 
 pub struct Checkpoint<'a> {
@@ -53,7 +55,7 @@ pub struct Checkpoint<'a> {
 }
 
 const MAGIC: u64 = 0x11a8b23d4760cdb4;
-const HEADER_SIZE: u32 = 512;
+const HEADER_SIZE: u32 = 100;
 const FRAME_HEADER_SIZE: u32 = 16;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -150,8 +152,7 @@ impl Wal {
         }
 
         file.seek(SeekFrom::Start(0))?;
-
-        let mut rdr = BufReader::new(&mut *file);
+        let mut rdr = BufReader::with_capacity(HEADER_SIZE as usize, &mut *file);
         
         let magic = rdr.read_u64::<LittleEndian>()?;
         let page_size = rdr.read_u32::<LittleEndian>()?;
@@ -169,10 +170,13 @@ impl Wal {
     fn write_header(&mut self, h: Header, lock: &CheckpointLock) -> Result<()> {
         let mut file = self.file.borrow_mut();
         file.seek(SeekFrom::Start(0))?;
-        let mut wtr = BufWriter::new(&mut *file);
+        let mut wtr = BufWriter::with_capacity(HEADER_SIZE as usize, &mut *file);
         wtr.write_u64::<LittleEndian>(h.magic)?;
         wtr.write_u32::<LittleEndian>(h.page_size.to_u32())?;
         wtr.write_u64::<LittleEndian>(h.epoch)?;
+        if wtr.into_inner().is_err() {
+            bail!("writing Wal header");
+        }
 
         Ok(())
     }
@@ -214,42 +218,49 @@ impl Wal {
     fn read_page(&self, bn: PageNum, lock: &ReadOrWriteLock) -> Result<Option<Page>>
     {
         if let Some(frame_num) = self.frame_map.pages.get(&bn).cloned() {
-            let mut page = Page::new(self.page_size);
-
-            let u8_sz = mem::size_of::<u32>() as u64;
-            let u64_sz = mem::size_of::<u64>() as u64;
-            let header_sz = u8_sz * 2 + u64_sz;
-            self.seek_frame_offset(frame_num, header_sz)?;
-            let mut file = self.file.borrow_mut();
-            file.read_exact(page.buf_mut())?;
-
+            let page = self.read_page_frame(frame_num, lock)?;
             Ok(Some(page))
         } else {
             Ok(None)
         }
     }
 
-    fn write_page(&mut self, i: PageNum, p: Page, lock: &WriteLock) -> Result<()> {
-        let frame_num = self.frame_map.num_frames;
-        self.write_frame(frame_num, i, p, lock)?;
-        self.frame_map.num_frames += 1;
-        self.frame_map.pages.insert(i, frame_num);
+    fn read_page_frame(&self, fr: FrameNum, lock: &ReadOrWriteLock) -> Result<Page> {
+        let mut page = Page::new(self.page_size);
 
+        let u8_sz = mem::size_of::<u32>() as u64;
+        let u64_sz = mem::size_of::<u64>() as u64;
+        let header_sz = u8_sz * 2 + u64_sz;
+        self.seek_frame_offset(fr, header_sz)?;
+        let mut file = self.file.borrow_mut();
+        file.read_exact(page.buf_mut())?;
+        Ok(page)
+    }
+
+    fn write_frame(&mut self, i: PageNum, p: Page,
+                   fr_map: &mut FrameMap, lock: &WriteLock) -> Result<()> {
+        let frame_num = fr_map.num_frames;
+        self.write_frame_(frame_num, i, p, lock)?;
+        fr_map.num_frames += 1;
+        fr_map.pages.insert(i, frame_num);
         Ok(())
     }
 
-    fn write_frame(&mut self, frame_num: FrameNum,
-                   page_num: PageNum, b: Page, lock: &WriteLock) -> Result<()>
+    fn write_frame_(&mut self, frame_num: FrameNum,
+                    page_num: PageNum, b: Page, lock: &WriteLock) -> Result<()>
     {
         assert!(b.buf().len() as u32 == self.page_size.to_u32());
         self.seek_frame(frame_num)?;
         let mut file = self.file.borrow_mut();
-        let mut wtr = BufWriter::new(&mut *file);
+        
+        let mut wtr = BufWriter::with_capacity(self.frame_size() as usize, &mut *file);
         wtr.write_u32::<LittleEndian>(page_num)?;
         wtr.write_u32::<LittleEndian>(0)?;
         wtr.write_u64::<LittleEndian>(self.epoch)?;
         wtr.write_all(b.buf())?;
-        wtr.flush()?; // FIXME don't flush. Need a better BufWriter?
+        if wtr.into_inner().is_err() {
+            bail!("writing Wal frame")
+        }
 
         Ok(())
     }
@@ -314,17 +325,21 @@ impl Wal {
         Ok(())
     }
 
-    fn commit(&mut self, lock: &WriteLock) -> Result<()> {
-        if self.frame_map.num_frames == 0 {
+    fn commit(&mut self, frame_map: &FrameMap, lock: &WriteLock) -> Result<()> {
+        if frame_map.num_frames == 0 {
             return Ok(());
         }
 
         // Set the commit flag on last written page
-        let frame = self.frame_map.num_frames - 1;
+        let frame = frame_map.num_frames - 1;
         let commit_flag_offset = mem::size_of::<u32>() as u64;
         self.seek_frame_offset(frame, commit_flag_offset)?;
         let mut file = self.file.borrow_mut();
         file.write_u32::<LittleEndian>(1)?;
+
+        // Update the frame map
+        self.frame_map.num_frames = frame_map.num_frames;
+        self.frame_map.pages.extend(frame_map.pages.iter());
 
         Ok(())
     }
@@ -367,14 +382,25 @@ impl<'a> WriteWal<'a> {
     fn new(wal: &'a mut Wal) -> Result<WriteWal<'a>> {
         let lock = wal.write_lock()?;
         wal.update_frame_map(&lock)?;
+        let num_frames = wal.frame_map.num_frames;
         Ok(WriteWal {
             wal: wal,
             lock: lock,
+            uncommitted_frame_map: FrameMap {
+                num_frames: num_frames,
+                pages: BTreeMap::new(),
+            },
+            disarm: false,
         })
     }
 
     pub fn read_page(&self, i: PageNum) -> Result<Option<Page>> {
-        self.wal.read_page(i, &self.lock)
+        if let Some(frame_num) = self.uncommitted_frame_map.pages.get(&i).cloned() {
+            let page = self.wal.read_page_frame(frame_num, &self.lock)?;
+            Ok(Some(page))
+        } else {
+            self.wal.read_page(i, &self.lock)
+        }
     }
 
     /// # Note
@@ -383,21 +409,25 @@ impl<'a> WriteWal<'a> {
     /// page store. Wabl will know to extend the page store during
     /// checkpointing.
     pub fn write_page(&mut self, i: PageNum, p: Page) -> Result<()> {
-        self.wal.write_page(i, p, &self.lock)
+        self.wal.write_frame(i, p, &mut self.uncommitted_frame_map, &self.lock)
     }
 
-    pub fn commit(self) -> Result<()> {
-        self.wal.commit(&self.lock)
+    pub fn commit(mut self) -> Result<()> {
+        self.disarm = true;
+        self.wal.commit(&self.uncommitted_frame_map, &self.lock)
     }
 
-    pub fn rollback(self) -> Result<()> {
+    pub fn rollback(mut self) -> Result<()> {
+        self.disarm = true;
         panic!()
     }
 }
 
 impl<'a> Drop for WriteWal<'a> {
     fn drop(&mut self) {
-        // FIXME drop bomb
+        if !self.disarm {
+            panic!("WriteWal drop bomb")
+        }
     }
 }
 

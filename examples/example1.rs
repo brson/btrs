@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 extern crate btrs;
 
 use std::fs;
